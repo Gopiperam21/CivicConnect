@@ -25,6 +25,14 @@ app.use('/api/incidents', incidentsRouter)
 app.use('/api/notifications', notificationsRouter)
 app.use('/api/readings', readingsRouter)
 app.use('/api/map', mapsRouter)
+if (process.env.NODE_ENV === 'production') {
+  const frontendDist = resolve(dirname(fileURLToPath(import.meta.url)), '../frontend/dist')
+  app.use(express.static(frontendDist))
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next()
+    res.sendFile(resolve(frontendDist, 'index.html'))
+  })
+}
 app.use((error, _req, res, _next) => {
   console.error(error.message)
   res.status(500).json({ error: 'Something went wrong while processing your request.' })
