@@ -44,19 +44,21 @@ router.get('/places', async (req, res) => {
   const cached = placeCache.get(key)
   if (cached && Date.now() - cached.time < 5 * 60 * 1000) return res.json(cached.data)
   // Return a broad nearby set so the map and results panel stay in sync for a whole city area.
-  const query = `[out:json][timeout:25];(nwr["amenity"~"^(restaurant|cafe|fast_food|food_court)$"](around:10000,${lat},${lon});nwr["shop"~"^(mall|supermarket|department_store)$"](around:10000,${lat},${lon}););out tags center 300;`
+  const query = `[out:json][timeout:25];(nwr["amenity"~"^(restaurant|cafe|fast_food|food_court)$"](around:15000,${lat},${lon});nwr["shop"~"^(mall|supermarket|department_store)$"](around:15000,${lat},${lon}););out tags center 1000;`
   let lastError
   for (const endpoint of ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter']) {
     try {
-      const data = await fetchJson(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'User-Agent': 'CitySync/1.0 (city map places)', 'Accept': 'application/json' }, body: `data=${encodeURIComponent(query)}` }, 6500)
-      placeCache.set(key, { time: Date.now(), data })
-      return res.json(data)
+      const data = await fetchJson(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'User-Agent': 'CitySync/1.0 (city map places)', 'Accept': 'application/json' }, body: `data=${encodeURIComponent(query)}` }, 18000)
+      if (data.elements?.length) {
+        placeCache.set(key, { time: Date.now(), data })
+        return res.json(data)
+      }
     } catch (error) { lastError = error }
   }
   try {
     const food = await nominatimSearch(`restaurants and cafes in ${city}`)
-    const shopping = await nominatimSearch(`malls in ${city}`)
-    const near = result => Math.abs(Number(result.lat) - lat) < 0.5 && Math.abs(Number(result.lon) - lon) < 0.5
+    const shopping = await nominatimSearch(`malls and shopping centres in ${city}`)
+    const near = result => Math.abs(Number(result.lat) - lat) < 1 && Math.abs(Number(result.lon) - lon) < 1
     const elements = [
       ...food.filter(near).map(item => ({ type: 'nominatim', id: item.place_id, lat: Number(item.lat), lon: Number(item.lon), tags: { name: item.name || item.display_name.split(',')[0], amenity: 'restaurant' } })),
       ...shopping.filter(near).map(item => ({ type: 'nominatim', id: item.place_id, lat: Number(item.lat), lon: Number(item.lon), tags: { name: item.name || item.display_name.split(',')[0], shop: 'mall' } }))
@@ -67,6 +69,24 @@ router.get('/places', async (req, res) => {
   } catch (error) { lastError = error }
   console.error('Nearby places lookup failed:', lastError?.message)
   res.status(502).json({ error: 'Nearby places are temporarily unavailable. Please try again shortly.' })
+})
+
+router.get('/places/search', async (req, res) => {
+  const query = String(req.query.q || '').trim().slice(0, 100)
+  const city = String(req.query.city || '').trim().slice(0, 120)
+  if (query.length < 2) return res.json({ elements: [] })
+  try {
+    const results = await nominatimSearch(`${query}${city ? `, ${city}` : ''}, India`)
+    const elements = results.map(item => {
+      const type = String(item.type || item.class || '').toLowerCase()
+      const category = /mall|shop|supermarket|department_store/.test(type) ? 'Mall' : /restaurant|cafe|fast_food|food_court|bar/.test(type) ? 'Restaurant' : 'Place'
+      return { type: 'nominatim', id: item.place_id, lat: Number(item.lat), lon: Number(item.lon), tags: { name: item.name || item.display_name?.split(',')[0] || query, category, amenity: category === 'Restaurant' ? 'restaurant' : undefined, shop: category === 'Mall' ? 'mall' : undefined } }
+    }).filter(item => Number.isFinite(item.lat) && Number.isFinite(item.lon))
+    res.json({ elements })
+  } catch (error) {
+    console.error('Place search failed:', error.message)
+    res.status(502).json({ error: 'Place search is temporarily unavailable.' })
+  }
 })
 
 router.get('/reverse', async (req, res) => {

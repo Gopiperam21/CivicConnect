@@ -119,6 +119,8 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
   const [cityQuery, setCityQuery] = useState(city)
   const [cityResults, setCityResults] = useState([])
   const [places, setPlaces] = useState([])
+  const [placeSearchResults, setPlaceSearchResults] = useState([])
+  const [searchingPlaces, setSearchingPlaces] = useState(false)
   const [category, setCategory] = useState('All places')
   const [placeQuery, setPlaceQuery] = useState('')
   const [userLocation, setUserLocation] = useState(null)
@@ -143,7 +145,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
 
   useEffect(() => {
     if (!mapElement.current || mapRef.current) return
-    const map = L.map(mapElement.current, { zoomControl: true }).setView([gunturCenter.lat, gunturCenter.lon], 13)
+    const map = L.map(mapElement.current, { zoomControl: true, zoomSnap: 0.5, zoomDelta: 0.5, wheelPxPerZoomLevel: 120, wheelDebounceTime: 100, inertia: false, worldCopyJump: true }).setView([gunturCenter.lat, gunturCenter.lon], 13)
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,
       crossOrigin: true,
@@ -154,14 +156,15 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     searchLayer.current = L.layerGroup().addTo(map)
     complaintLayer.current = L.layerGroup().addTo(map)
     map.on('click', event => {
-      if (!chooseOnMapRef.current) return
-      setDestination({ name: 'Pinned destination', lat: event.latlng.lat, lon: event.latlng.lng, category: 'Destination' })
-      destinationRef.current = { name: 'Pinned destination', lat: event.latlng.lat, lon: event.latlng.lng, category: 'Destination' }
-      reportLocationRef.current?.({ lat: event.latlng.lat, lon: event.latlng.lng })
+      const point = { lat: event.latlng.lat, lon: event.latlng.lng }
+      const picked = { name: 'Pinned map point', ...point, category: 'Destination' }
+      if (chooseOnMapRef.current) reportLocationRef.current?.(point)
+      setDestination(picked)
+      destinationRef.current = picked
       setRoute(null); routeRef.current = null
       setChooseOnMap(false)
       setError('')
-      setStatus('Destination pinned. Select Get directions to calculate a route.')
+      setStatus('Map point selected. Select Get directions to route from your current location.')
     })
     mapRef.current = map
     setMapInstance(map)
@@ -174,7 +177,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     complaints.filter(item => item.location && Number.isFinite(Number(item.location.lat)) && Number.isFinite(Number(item.location.lon))).forEach(item => {
       const label = document.createElement('span')
       label.textContent = `${item.department} · ${item.title} · ${item.status}`
-      L.circleMarker([item.location.lat, item.location.lon], { radius: 8, color: '#fff', weight: 2, fillColor: '#d96d59', fillOpacity: .9 }).bindTooltip(label).addTo(complaintLayer.current)
+      L.circleMarker([item.location.lat, item.location.lon], { radius: 8, color: '#fff', weight: 2, fillColor: '#d96d59', fillOpacity: .9, bubblingMouseEvents: false }).bindTooltip(label).addTo(complaintLayer.current)
     })
   }, [mapInstance, complaints])
 
@@ -185,7 +188,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     document.getElementById('city-map')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }, [pickLocation, mapInstance])
 
-  useEffect(() => { if (mapInstance) mapInstance.setView([center.lat, center.lon], center.zoom || 13) }, [mapInstance, center])
+  useEffect(() => { if (mapInstance) mapInstance.setView([center.lat, center.lon], center.zoom || 13, { animate: false }) }, [mapInstance, center])
   useEffect(() => { if (city && city !== cityQuery) setCityQuery(city) }, [city])
 
   const loadNearby = async (point, cityName = city) => {
@@ -200,7 +203,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
         const lat = item.lat ?? item.center?.lat
         const lon = item.lon ?? item.center?.lon
         const tags = item.tags || {}
-        const kind = tags.amenity ? 'Restaurant' : tags.shop === 'mall' ? 'Mall' : 'Shopping'
+        const kind = tags.amenity ? 'Restaurant' : tags.shop === 'mall' ? 'Mall' : tags.category || 'Shopping'
         return { id: `${item.type}-${item.id}`, name: tags.name || tags['name:en'] || kind, lat, lon, category: kind }
       }).filter(item => Number.isFinite(item.lat) && Number.isFinite(item.lon))
       found.sort((a, b) => (a.lat - point.lat) ** 2 + (a.lon - point.lon) ** 2 - ((b.lat - point.lat) ** 2 + (b.lon - point.lon) ** 2))
@@ -214,16 +217,40 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
 
   useEffect(() => { if (mapInstance) loadNearby(center, city) }, [mapInstance, city])
 
-  const visiblePlaces = useMemo(() => places.filter(place => {
+  useEffect(() => {
+    const query = placeQuery.trim()
+    if (query.length < 2) { setPlaceSearchResults([]); setSearchingPlaces(false); return }
+    let cancelled = false
+    setSearchingPlaces(true)
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/map/places/search?q=${encodeURIComponent(query)}&city=${encodeURIComponent(city)}`)
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || 'Place search is temporarily unavailable.')
+        if (cancelled) return
+        const found = (data.elements || []).map(item => {
+          const tags = item.tags || {}
+          const category = tags.amenity ? 'Restaurant' : tags.shop === 'mall' ? 'Mall' : tags.category || 'Place'
+          return { id: `${item.type}-${item.id}`, name: tags.name || query, lat: Number(item.lat ?? item.center?.lat), lon: Number(item.lon ?? item.center?.lon), category }
+        }).filter(item => Number.isFinite(item.lat) && Number.isFinite(item.lon))
+        setPlaceSearchResults(found)
+      } catch (searchError) {
+        if (!cancelled) { setPlaceSearchResults([]); setError(searchError.message) }
+      } finally { if (!cancelled) setSearchingPlaces(false) }
+    }, 450)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [placeQuery, city])
+
+  const visiblePlaces = useMemo(() => (placeQuery.trim().length >= 2 ? placeSearchResults : places).filter(place => {
     const matchesCategory = category === 'All places' || (category === 'Restaurants' ? place.category === 'Restaurant' : ['Mall', 'Shopping'].includes(place.category))
-    return matchesCategory && place.name.toLowerCase().includes(placeQuery.toLowerCase())
-  }), [places, category, placeQuery])
+    return matchesCategory && (placeQuery.trim().length >= 2 || place.name.toLowerCase().includes(placeQuery.toLowerCase()))
+  }), [places, placeSearchResults, category, placeQuery])
 
   useEffect(() => {
     if (!mapInstance || !markerLayer.current) return
     markerLayer.current.clearLayers()
     visiblePlaces.forEach(place => {
-      const marker = L.circleMarker([place.lat, place.lon], { radius: 7, color: '#fff', weight: 2, fillColor: place.category === 'Restaurant' ? '#e68c58' : '#7184d9', fillOpacity: 1 })
+      const marker = L.circleMarker([place.lat, place.lon], { radius: 7, color: '#fff', weight: 2, fillColor: place.category === 'Restaurant' ? '#e68c58' : '#7184d9', fillOpacity: 1, bubblingMouseEvents: false })
       const label = document.createElement('span')
       label.textContent = `${place.category}: ${place.name}`
       marker.bindTooltip(label).on('click', () => { setDestination(place); destinationRef.current = place; setRoute(null); routeRef.current = null; setError(''); setStatus(`${place.name} selected. Get directions from your location.`) })
@@ -232,7 +259,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     if (destination) {
       const pinLabel = document.createElement('span')
       pinLabel.textContent = destination.name
-      L.circleMarker([destination.lat, destination.lon], { radius: 9, color: '#fff', weight: 3, fillColor: '#dc6756', fillOpacity: 1 }).addTo(markerLayer.current).bindTooltip(pinLabel)
+      L.circleMarker([destination.lat, destination.lon], { radius: 9, color: '#fff', weight: 3, fillColor: '#dc6756', fillOpacity: 1, bubblingMouseEvents: false }).addTo(markerLayer.current).bindTooltip(pinLabel)
     }
   }, [mapInstance, visiblePlaces, destination])
 
@@ -241,7 +268,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     searchLayer.current.clearLayers()
     const results = cityResults.filter(result => Number.isFinite(Number(result.lat)) && Number.isFinite(Number(result.lon)))
     const pins = results.map((result, index) => {
-      const marker = L.circleMarker([Number(result.lat), Number(result.lon)], { radius: 10, color: '#fff', weight: 3, fillColor: '#7958c7', fillOpacity: .95 })
+      const marker = L.circleMarker([Number(result.lat), Number(result.lon)], { radius: 10, color: '#fff', weight: 3, fillColor: '#7958c7', fillOpacity: .95, bubblingMouseEvents: false })
       const label = document.createElement('span')
       label.textContent = result.name || result.display_name?.split(',')[0] || `Search result ${index + 1}`
       marker.bindTooltip(label).on('click', () => selectCity(result)).addTo(searchLayer.current)
@@ -339,7 +366,7 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     locationWatch.current = navigator.geolocation.watchPosition(position => {
       const point = { lat: position.coords.latitude, lon: position.coords.longitude, zoom: 15 }
       setUserLocation(point)
-      setCenter(point)
+      if (!cityResolvedFromGps.current) setCenter(point)
       setTracking(true)
       if (!cityResolvedFromGps.current) {
         cityResolvedFromGps.current = true
@@ -548,10 +575,10 @@ function LiveMap({ city, onCityChange, pickLocation = false, onReportLocation, c
     <div className="panel-heading live-map-heading"><div><h2>City map & live navigation</h2><p>Plan a road route, then follow live GPS guidance</p></div><span className="map-live-pill"><i/>OpenStreetMap</span></div>
     <div className="city-search-row"><form onSubmit={searchCity} className="city-search-form"><Icon name="search" size={16}/><input id="city-search-input" aria-label="Search an Indian city" value={cityQuery} onChange={event => setCityQuery(event.target.value)} placeholder="Search a city in India"/><button type="submit">Find city</button></form><button className={`location-button ${tracking?'tracking':''}`} onClick={findMyLocation}>{navigationActive?'Stop navigation':tracking?'Stop live location':'◎ Detect my city'}</button></div>
     {cityResults.length>0&&<div className="city-results">{cityResults.map((result,index)=><button key={`${result.place_id}-${index}`} onClick={()=>selectCity(result)}><strong>{result.name||result.display_name.split(',')[0]}</strong><span>{result.display_name}</span></button>)}</div>}
-    <div className="live-map-toolbar"><div className="map-tabs">{['All places','Restaurants','Malls'].map(item=><button key={item} className={category===item?'selected':''} onClick={()=>setCategory(item)}>{item}</button>)}</div><button className="subtle-button" disabled={loadingPlaces} onClick={()=>loadNearby(center)}>{loadingPlaces?'Searching...':'Refresh nearby'}</button></div>
+    <div className="live-map-toolbar"><div className="map-tabs">{['All places','Restaurants','Malls'].map(item=><button key={item} className={category===item?'selected':''} onClick={()=>setCategory(item)}>{item}</button>)}</div><span className="map-tap-hint">Click map to choose a destination</span><button className="subtle-button" disabled={loadingPlaces} onClick={()=>loadNearby(center)}>{loadingPlaces?'Searching...':'Refresh nearby'}</button></div>
     <div className="live-map-layout"><div className="live-map-frame"><div className="leaflet-map" ref={mapElement} aria-label="Interactive city map with restaurants, malls and route navigation"/><div className="map-attribution-note">Map tiles and places © OpenStreetMap contributors</div></div>
       <aside className="places-panel"><div className="places-panel-head"><div><strong>{route?'Route directions':'Nearby places'}</strong><span>{route?`${meters(navigationActive?remainingDistance:route.distance)} · ${duration(navigationActive?remainingDuration:route.duration)}${navigationActive?' remaining':''}`:`${visiblePlaces.length} results near ${city}`}</span></div>{route&&<button onClick={()=>{stopNavigation();setRoute(null);routeRef.current=null}}>Places</button>}</div>
-        {route?<><div className={`navigation-card ${navigationActive?'active':''}`}><div className="navigation-card-top"><span><i className={navigationActive?'live-dot':''}/>{navigationActive?(rerouting?'REROUTING':'LIVE NAVIGATION'):'ROUTE PREVIEW'}</span><strong>{navigationActive?`${meters(remainingDistance)} · ${duration(remainingDuration)} left`:`${meters(route.distance)} · about ${duration(route.duration)}`}</strong></div>{navigationActive&&route.steps[activeStep]&&<div className="navigation-next"><span className="turn-arrow">↱</span><div><strong>{route.steps[activeStep].instruction}</strong><small>{meters(distanceToTurn)} to next turn</small></div></div>}<button className="primary-button" onClick={navigationActive?stopNavigation:startNavigation}>{navigationActive?'Stop navigation':'▶ Start live navigation'}</button></div><div className="route-endpoints"><span className="start-dot"/>Your location<Icon name="chevron" size={13}/><b>{destination?.name}</b></div><div className="route-steps">{route.steps.map((step,index)=><div className={`route-step ${navigationActive&&index===activeStep?'current':''}`} key={`${index}-${step.instruction}`}><span>{index+1}</span><div><strong>{step.instruction}</strong><small>{meters(step.distance)}</small></div></div>)}</div><div className="route-export-actions"><a className="google-maps-link" href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${destination?.lat},${destination?.lon}`)}&travelmode=driving&dir_action=navigate`} target="_blank" rel="noreferrer">Open in Google Maps ↗</a><button className="download-route-button" onClick={downloadRoute}>Download full route map (PNG)</button></div><small className="route-export-note">The image frames the complete route and surrounding streets.</small></>:<><label className="place-search"><Icon name="search" size={14}/><input value={placeQuery} onChange={event=>setPlaceQuery(event.target.value)} placeholder="Filter restaurants or malls"/></label><div className="place-list">{loadingPlaces&&<div className="places-message">Finding places around the map...</div>}{!loadingPlaces&&visiblePlaces.map(place=><button className={`place-row ${destination?.id===place.id?'selected':''}`} key={place.id} onClick={()=>{setDestination(place);destinationRef.current=place;setRoute(null);routeRef.current=null;setError('');setStatus(`${place.name} selected. Get directions from your location.`)}}><span className={`place-icon ${place.category==='Restaurant'?'food':'mall'}`}>{place.category==='Restaurant'?'R':'M'}</span><span className="place-name"><strong>{place.name}</strong><small>{place.category}</small></span><Icon name="chevron" size={14}/></button>)}{!loadingPlaces&&!visiblePlaces.length&&<div className="places-message">No matching places here yet. Search another city or refresh nearby.</div>}</div>{destination&&<div className="destination-card"><span>DESTINATION</span><strong>{destination.name}</strong><small>{destination.category}</small><button className="primary-button" disabled={loadingRoute} onClick={getDirections}>{loadingRoute?'Finding route...':'Get directions'}</button></div>}</>}
+        {route?<><div className={`navigation-card ${navigationActive?'active':''}`}><div className="navigation-card-top"><span><i className={navigationActive?'live-dot':''}/>{navigationActive?(rerouting?'REROUTING':'LIVE NAVIGATION'):'ROUTE PREVIEW'}</span><strong>{navigationActive?`${meters(remainingDistance)} · ${duration(remainingDuration)} left`:`${meters(route.distance)} · about ${duration(route.duration)}`}</strong></div>{navigationActive&&route.steps[activeStep]&&<div className="navigation-next"><span className="turn-arrow">↱</span><div><strong>{route.steps[activeStep].instruction}</strong><small>{meters(distanceToTurn)} to next turn</small></div></div>}<button className="primary-button" onClick={navigationActive?stopNavigation:startNavigation}>{navigationActive?'Stop navigation':'▶ Start live navigation'}</button></div><div className="route-endpoints"><span className="start-dot"/>Your location<Icon name="chevron" size={13}/><b>{destination?.name}</b></div><div className="route-steps">{route.steps.map((step,index)=><div className={`route-step ${navigationActive&&index===activeStep?'current':''}`} key={`${index}-${step.instruction}`}><span>{index+1}</span><div><strong>{step.instruction}</strong><small>{meters(step.distance)}</small></div></div>)}</div><div className="route-export-actions"><a className="google-maps-link" href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${destination?.lat},${destination?.lon}`)}&travelmode=driving&dir_action=navigate`} target="_blank" rel="noreferrer">Open in Google Maps ↗</a><button className="download-route-button" onClick={downloadRoute}>Download full route map (PNG)</button></div><small className="route-export-note">The image frames the complete route and surrounding streets.</small></>:<><label className="place-search"><Icon name="search" size={14}/><input value={placeQuery} onChange={event=>setPlaceQuery(event.target.value)} placeholder="Search places, restaurants, malls"/></label><div className="place-list">{loadingPlaces&&<div className="places-message">Finding places around the map...</div>}{searchingPlaces&&<div className="places-message">Searching popular places...</div>}{!loadingPlaces&&!searchingPlaces&&visiblePlaces.map(place=><button className={`place-row ${destination?.id===place.id?'selected':''}`} key={place.id} onClick={()=>{setDestination(place);destinationRef.current=place;setRoute(null);routeRef.current=null;setError('');setStatus(`${place.name} selected. Get directions from your location.`)}}><span className={`place-icon ${place.category==='Restaurant'?'food':place.category==='Mall'?'mall':'place'}`}>{place.category==='Restaurant'?'R':place.category==='Mall'?'M':'P'}</span><span className="place-name"><strong>{place.name}</strong><small>{place.category}</small></span><Icon name="chevron" size={14}/></button>)}{!loadingPlaces&&!searchingPlaces&&!visiblePlaces.length&&<div className="places-message">{placeQuery.trim().length>=2?'No places found for that search. Try a nearby landmark or restaurant name.':'No places found nearby. Try refreshing or search a place by name.'}</div>}</div>{destination&&<div className="destination-card"><span>DESTINATION</span><strong>{destination.name}</strong><small>{destination.category}</small><button className="primary-button" disabled={loadingRoute} onClick={getDirections}>{loadingRoute?'Finding route...':'Get directions'}</button></div>}</>}
       </aside></div>
     <div className={`map-status ${error?'has-error':''}`} role="status">{error||status}</div>
     {route&&<div className="route-download-mobile"><button className="download-route-button" onClick={downloadRoute}>Download full route map (PNG)</button></div>}
